@@ -41,6 +41,11 @@
 ##                 margins, or a leaf that was not lying flat on the glass.
 ##   extra_object  something else on the plate is a decent fraction of the size
 ##                 of the leaf. Check the mask; a second leaf will be ignored.
+##   interior_recovered
+##                 part of the leaf was too pale to threshold and was recovered
+##                 by sealing the outline and accepting the enclosed region on
+##                 the strength of its texture. `recovered_px` says how much.
+##                 Check the mask.
 ##   touches_edge  the leaf reaches the edge of the measured region. Usually a
 ##                 lower bound, though after the lateral correction the loss is
 ##                 only the few columns the lid had effectively blinded.
@@ -97,6 +102,21 @@
 #'   leaf, since [refine_cutoff()] then puts the real boundary in place.
 #' @param core_erode_px Radius the leaf is shrunk by before its tone is read, so
 #'   soft edge pixels do not drag the cutoff around.
+#' @param recover_pale_interior Whether to run [recover_interior()], which
+#'   looks inside the outline of a measured leaf for lamina too pale to
+#'   threshold. Set `FALSE` to reproduce the behaviour of the pipeline without
+#'   it.
+#' @param texture_px Window radius for the local standard deviation that
+#'   distinguishes a specimen from paper.
+#' @param texture_ratio How many times the paper's own local SD a region must
+#'   exceed to count as textured. Paper measures 0.4 to 0.6 and a tomentose
+#'   lamina 5 to 7, so this is not a delicate threshold.
+#' @param texture_frac Fraction of a candidate region that must read as textured
+#'   before it is accepted as leaf.
+#' @param interior_min_frac Smallest region [recover_interior()] will consider,
+#'   as a fraction of the leaf already found. A lamina that thresholding missed
+#'   is a substantial part of the leaf; anything smaller is a sliver of hull
+#'   slack and is skipped, which is also what keeps the step affordable.
 #' @param ring_inner_px,ring_outer_px The paper tone is read from a frame around
 #'   the leaf standing off by `ring_inner_px` and extending `ring_outer_px`.
 #'   Local rather than global, so shading across the glass cannot bias it.
@@ -132,6 +152,11 @@ leaf_area_options = function(
     detect_px          = 800,
     detect_fraction    = 0.35,
     core_erode_px      = 3,
+    recover_pale_interior = TRUE,
+    texture_px         = 3,
+    texture_ratio      = 4,
+    texture_frac       = 0.5,
+    interior_min_frac  = 0.05,
     ring_inner_px      = 12,
     ring_outer_px      = 60,
     max_iterations     = 12,
@@ -393,6 +418,115 @@ erode = function(mask, r) {
   out
 }
 
+#' Dilate a logical mask by a square structuring element
+#'
+#' The dual of [erode()], by De Morgan: growing the object is the same as
+#' eroding its background.
+#'
+#' @param mask Logical matrix.
+#' @param r Radius in pixels.
+#' @return A logical matrix the same size as `mask`.
+dilate = function(mask, r) !erode(!mask, r)
+
+#' Close a logical mask: dilate, then erode by the same radius
+#'
+#' Bridges gaps up to about `2r` across without moving the outer boundary of
+#' anything larger than the structuring element. Used to seal a leaf outline
+#' that is interrupted, so that [fill_holes()] has something enclosed to fill.
+#'
+#' @param mask Logical matrix.
+#' @param r Radius in pixels.
+#' @return A logical matrix the same size as `mask`.
+closing = function(mask, r) erode(dilate(mask, r), r)
+
+#' Mean of each (2r+1) x (2r+1) window
+#'
+#' Separable, so it costs `2(2r+1)` shifted additions rather than `(2r+1)^2`
+#' neighborhood lookups. Edge pixels are handled by replicating the border.
+#'
+#' @param m Numeric matrix.
+#' @param r Window radius.
+#' @return A numeric matrix the same size as `m`.
+box_mean = function(m, r) {
+  along = function(m, axis) {
+    n = dim(m)[axis]
+    acc = NULL
+    for (k in -r:r) {
+      j = pmin(pmax(seq_len(n) + k, 1L), n)          # replicate at the edges
+      slab = if (axis == 2L) m[, j, drop = FALSE] else m[j, , drop = FALSE]
+      acc = if (is.null(acc)) slab else acc + slab
+    }
+    acc / (2L * r + 1L)
+  }
+  along(along(m, 2L), 1L)
+}
+
+#' Local standard deviation over a square window
+#'
+#' The texture channel. Paper is optically smooth: on the scans this was built
+#' for it measures a local SD of 0.4 to 0.6 gray levels, essentially the sensor
+#' noise floor. Anything botanical is not: a leaf, and in particular a hairy or
+#' tomentose one, measures 5 to 7, a separation of more than tenfold that holds
+#' whether the surface is darker or brighter than the paper.
+#'
+#' That is why this exists. Intensity alone cannot find the white tomentum on
+#' the underside of a *Rhododendron* leaf, because it is the same brightness as
+#' the paper it is lying on. Texture can.
+#'
+#' @param m Numeric matrix.
+#' @param r Window radius.
+#' @return A numeric matrix of local standard deviations.
+local_sd = function(m, r) {
+  mu = box_mean(m, r)
+  sqrt(pmax(box_mean(m * m, r) - mu * mu, 0))
+}
+
+#' Convex hull of a logical mask, as a filled region
+#'
+#' The outline of what was identified: the smallest convex region containing
+#' every leaf pixel. Used by [recover_interior()] to define "inside the
+#' outline", the region within which a pale lamina might be hiding.
+#'
+#' A convex hull is deliberately chosen over a morphological closing. A closing
+#' needs a radius, and any radius large enough to bridge a gap in a leaf margin
+#' is also large enough to bridge the notches of a serrate leaf, which squares
+#' off the teeth of a *Betula* and quietly adds paper. The hull needs no radius
+#' at all, and because it is only ever used as a place to LOOK -- never as
+#' something to add -- its tendency to overshoot on a curved leaf costs nothing:
+#' the overshoot is paper, and the texture test rejects paper.
+#'
+#' @param mask Logical matrix with at least one `TRUE`.
+#' @return A logical matrix, `TRUE` inside the hull.
+convex_hull_mask = function(mask) {
+  edge = mask & !erode(mask, 1L)                    # boundary points suffice
+  idx  = which(if (any(edge)) edge else mask, arr.ind = TRUE)
+  h    = grDevices::chull(idx[, 2L], idx[, 1L])
+  if (length(h) < 3L) return(mask)
+  px = idx[h, 2L]; py = idx[h, 1L]; n = length(h)
+
+  ## A convex polygon meets each scanline in a single interval, so the fill is
+  ## just the running min and max of the edge crossings, row by row.
+  ys  = seq.int(min(py), max(py))
+  lo  = rep(Inf, length(ys)); hi = rep(-Inf, length(ys))
+  for (i in seq_len(n)) {
+    j = if (i == n) 1L else i + 1L
+    if (py[i] == py[j]) {
+      k = py[i] - ys[1L] + 1L
+      lo[k] = min(lo[k], px[i], px[j]); hi[k] = max(hi[k], px[i], px[j])
+    } else {
+      yy = seq.int(min(py[i], py[j]), max(py[i], py[j]))
+      xx = px[i] + (yy - py[i]) * (px[j] - px[i]) / (py[j] - py[i])
+      k  = yy - ys[1L] + 1L
+      lo[k] = pmin(lo[k], xx); hi[k] = pmax(hi[k], xx)
+    }
+  }
+  out = matrix(FALSE, nrow(mask), ncol(mask))
+  for (k in seq_along(ys))
+    if (is.finite(lo[k]))
+      out[ys[k], max(1L, floor(lo[k])):min(ncol(mask), ceiling(hi[k]))] = TRUE
+  out
+}
+
 #' Bounding box of a logical mask
 #'
 #' @param mask Logical matrix with at least one `TRUE`.
@@ -508,6 +642,26 @@ label_components = function(mask, diagonal = TRUE) {
        runs_of = runs_of,
        size    = vapply(runs_of, function(k) sum(run_len[k]), numeric(1L)),
        on_edge = vapply(runs_of, function(k) any(on_edge[k]), logical(1L)))
+}
+
+#' Paint one component into a matrix just big enough to hold it
+#'
+#' [draw_runs()] allocates a matrix the size of the whole window, which is
+#' ruinous when a hull leaves hundreds of small slivers to be examined one by
+#' one. This allocates only the component's own bounding box.
+#'
+#' @param cc A labeling from [label_components()].
+#' @param k Index of the component.
+#' @return A list with the bbox-sized logical `mask` and the `rows` and `cols`
+#'   it occupies in the original.
+region_box = function(cc, k) {
+  r  = cc$runs_of[[k]]
+  r0 = min(cc$row[r]);   r1 = max(cc$row[r])
+  c0 = min(cc$start[r]); c1 = max(cc$end[r])
+  out = matrix(FALSE, r1 - r0 + 1L, c1 - c0 + 1L)
+  for (i in r)
+    out[cc$row[i] - r0 + 1L, (cc$start[i] - c0 + 1L):(cc$end[i] - c0 + 1L)] = TRUE
+  list(mask = out, rows = r0:r1, cols = c0:c1)
 }
 
 #' Paint a set of runs into a fresh logical matrix
@@ -808,6 +962,112 @@ paper_level = function(roi, mask, cut, opt = OPT) {
   if (length(band) < 200) background_level(roi) else median(band)
 }
 
+#' Recover a leaf interior that thresholding could not see
+#'
+#' Some leaves are not uniformly darker than the paper. *Rhododendron
+#' groenlandicum* scanned abaxial side up is the case this was written for: the
+#' margins are revolute and roll under, so they read dark, while the lamina
+#' between them is covered in dense white tomentum measuring 243 to 248 gray
+#' against paper at 245. It is not darker than the paper at all, so no cutoff
+#' can find it, and no amount of contrast adjustment will change that.
+#'
+#' Hole filling ought to rescue it, and sometimes does -- but only when the dark
+#' margin happens to close into a loop. On the scan that prompted this the
+#' margin is interrupted at the leaf base, so the pale interior drains to the
+#' background and is not an enclosed hole. Worse, whether it closes turns on a
+#' single gray level: one level either side of the converged cutoff is the
+#' difference between 11,670 px and 18,355 px, a 57 percent swing. That
+#' knife-edge is the defect; moving the cutoff would not remove it.
+#'
+#' What separates the tomentum from the paper is not brightness but **texture**.
+#' Paper is optically smooth and measures a local standard deviation of 0.43 to
+#' 0.49 gray levels, essentially the sensor noise floor. The tomentum measures
+#' 5.2. That is more than a tenfold separation, and it holds whether the leaf
+#' surface is darker or brighter than the paper.
+#'
+#' So: look inside the convex hull of what was already identified, take each
+#' region there that is not yet leaf, and ask whether it is textured like a
+#' specimen or smooth like paper.
+#'
+#' @section Why this cannot damage a correct measurement:
+#' It only ever looks INSIDE the outline of what the validated pipeline already
+#' found, and it only ever ADDS. Three independent guards decide what is added:
+#' \itemize{
+#'   \item Regions are judged well clear of their own rim, since a texture
+#'     window straddling the leaf margin reads as textured whatever lies inside
+#'     it. A region too thin to have an interior is refused rather than guessed
+#'     at -- which is what keeps the notches between the teeth of a serrate
+#'     *Betula* leaf from being swallowed.
+#'   \item The verdict is texture, so a genuine hole in a leaf, a bay between
+#'     two teeth, and the slack a convex hull leaves around a curved needle are
+#'     all correctly read as paper and refused. Measured on the six scans that
+#'     were already right, every such region reads 0.48 against a paper 0.45,
+#'     and none is accepted.
+#'   \item `recovered_px` is reported in the output and sets the
+#'     `interior_recovered` flag, so an addition is never silent.
+#' }
+#'
+#' @section Known limitation:
+#' A leaf with a genuinely smooth pale interior -- glaucous, waxy, strongly
+#' specular -- reads like paper to this feature and will be refused. Scanning in
+#' color is the fix for that case: a pale lamina is rarely the same *hue* as
+#' white paper even when it is the same brightness.
+#'
+#' @param roi Numeric matrix, the refinement window.
+#' @param mask Logical matrix, the leaf as found by thresholding.
+#' @param cut The converged cutoff, used to locate paper for the texture
+#'   reference.
+#' @param opt Options from [leaf_area_options()]. Set
+#'   `recover_pale_interior = FALSE` to disable this step entirely.
+#' @return A list with the possibly enlarged `mask` and `recovered_px`.
+recover_interior = function(roi, mask, cut, opt = OPT) {
+  none = list(mask = mask, recovered_px = 0)
+  if (!isTRUE(opt$recover_pale_interior)) return(none)
+
+  ## Work in the leaf's own bounding box. The refinement window can be the whole
+  ## scan when a leaf runs off the bed, and there is nothing to find out there.
+  b = bounds(mask)
+  pad  = 2L * opt$texture_px + 2L
+  rows = max(1L, b[1L] - pad):min(nrow(mask), b[2L] + pad)
+  cols = max(1L, b[3L] - pad):min(ncol(mask), b[4L] + pad)
+  win  = mask[rows, cols, drop = FALSE]
+  roi  = roi[rows, cols, drop = FALSE]
+
+  hull   = convex_hull_mask(win)
+  inside = hull & !win
+
+  ## A lamina worth recovering is a substantial part of the leaf, not a sliver.
+  ## Requiring that up front is also what keeps this affordable: the hull of a
+  ## curved needle leaves hundreds of small staircase gaps, and examining each
+  ## one costs far more than the answer is worth.
+  floor_px = max(50, opt$interior_min_frac * sum(win))
+  if (sum(inside) < floor_px) return(none)
+
+  sd = local_sd(roi, opt$texture_px)
+  paper = !dilate(hull, 2L * opt$texture_px) & roi > cut
+  if (sum(paper) < 500) return(none)
+  hot = opt$texture_ratio * median(sd[paper])
+
+  cc = label_components(inside)
+  if (is.null(cc)) return(none)
+
+  keep = matrix(FALSE, nrow(win), ncol(win))
+  for (k in seq_along(cc$size)) {
+    if (cc$size[[k]] < floor_px) next
+    reg  = region_box(cc, k)
+    core = erode(reg$mask, 2L * opt$texture_px)
+    if (sum(core) < 50) next                        # too thin to judge: refuse
+    patch = sd[reg$rows, reg$cols, drop = FALSE]
+    if (mean(patch[core] > hot) > opt$texture_frac)
+      keep[reg$rows, reg$cols] = keep[reg$rows, reg$cols] | reg$mask
+  }
+  if (!any(keep)) return(none)
+
+  out = mask
+  out[rows, cols] = win | keep
+  list(mask = out, recovered_px = sum(keep))
+}
+
 #' Iterate the cutoff to the half-maximum between leaf and paper
 #'
 #' Read the leaf's tone and the paper around it, put the cutoff halfway between
@@ -847,7 +1107,15 @@ refine_cutoff = function(roi, cut, min_px, opt = OPT) {
     leaf_tone = median(roi[core])
     paper = paper_level(roi, mask, cut, opt)
 
-    new_cut = round((paper + leaf_tone) / 2)
+    ## The leaf must be darker than the paper somewhere, so a cutoff at or above
+    ## the paper level cannot be meaningful. Without this bound, a leaf whose
+    ## interior is paler than its margins and whose outline happens to close can
+    ## poison its own tone estimate: hole filling hands the pale interior to
+    ## `leaf_tone`, the cutoff climbs toward the paper, and the next pass calls
+    ## most of the plate leaf. The clamp costs nothing on a normal scan -- the
+    ## measured cutoffs here sit 30 to 50 gray levels below it -- and turns a
+    ## runaway into an honest `low_contrast` flag.
+    new_cut = min(round((paper + leaf_tone) / 2), paper - opt$min_contrast)
     last = list(cutoff = new_cut, mask = mask, seed = seed, roi = roi,
                 paper = paper, leaf_tone = leaf_tone,
                 contrast = paper - leaf_tone, holes_px = holes_px,
@@ -874,7 +1142,8 @@ recount = function(roi, cut, seed, min_px, opt = OPT) {
   if (is.null(cc)) return(NA_real_)
   pick = component_at(cc, seed, min_px, opt)
   if (is.na(pick)) return(NA_real_)
-  sum(fill_holes(draw_runs(cc, cc$runs_of[[pick]])))
+  mask = fill_holes(draw_runs(cc, cc$runs_of[[pick]]))
+  sum(recover_interior(roi, mask, cut, opt)$mask)
 }
 
 #' Measure the leaf in one flattened scan
@@ -960,10 +1229,13 @@ segment_leaf = function(gray, min_px = 50, opt = OPT) {
     cut = fit$cutoff
   }
 
-  ## --- 3. What else is on the plate? ----------------------------------------
+  ## --- 3. Recover an interior that thresholding could not see ---------------
+  rec = recover_interior(fit$roi, fit$mask, fit$cutoff, opt)
+
+  ## --- 4. What else is on the plate? ----------------------------------------
   census = object_census(small <= fit$cutoff, min_px / shrink^2, opt)
 
-  ## --- 4. How much does the answer depend on the cutoff? --------------------
+  ## --- 5. How much does the answer depend on the cutoff? --------------------
   ## Move the cutoff by a fraction of the leaf-to-paper contrast, each way, and
   ## re-measure. This is an honest error bar: it is large exactly when the leaf
   ## margin is soft, translucent or out of focus, which is when the area is
@@ -974,15 +1246,16 @@ segment_leaf = function(gray, min_px = 50, opt = OPT) {
   hi = recount(fit$roi, fit$cutoff + wiggle, fit$seed, min_px, opt)
 
   full = matrix(FALSE, nrow(gray), ncol(gray))
-  full[rows, cols] = fit$mask
+  full[rows, cols] = rec$mask
 
   list(mask         = full,
        cutoff       = fit$cutoff,
        paper        = fit$paper,
        leaf_tone    = fit$leaf_tone,
        contrast     = fit$contrast,
-       leaf_px      = sum(fit$mask),
+       leaf_px      = sum(rec$mask),
        holes_px     = fit$holes_px,
+       recovered_px = rec$recovered_px,
        n_objects    = census$n_objects,
        second_frac  = census$second_frac,
        touches_edge = fit$touches_edge,
@@ -1114,7 +1387,7 @@ match_standard = function(dpi, calibration, opt = OPT) {
 output_columns = function() {
   c("scan_id", "file", "width_px", "height_px", "dpi", "trimmed_px", "standard",
     "cutoff", "paper", "leaf_tone", "contrast", "n_objects", "leaf_px",
-    "holes_px", "frac_of_image", "area_cm2", "area_m2", "area_cm2_lo",
+    "holes_px", "recovered_px", "frac_of_image", "area_cm2", "area_m2", "area_cm2_lo",
     "area_cm2_hi", "area_sens_pct", "area_cm2_dpi", "flags")
 }
 
@@ -1168,6 +1441,7 @@ measure_scan = function(path, calibration, opt = OPT, mask_dir = NULL) {
     if (isTRUE(sens     > opt$max_sensitivity))  "soft_margin",
     if (seg$second_frac > opt$max_second_object) "extra_object",
     if (seg$touches_edge)                        "touches_edge",
+    if (seg$recovered_px > 0)                    "interior_recovered",
     if (!is.na(area_dpi) &&
         abs(area_dpi / area_cm2 - 1) > opt$dpi_tolerance) "dpi_mismatch"
   )
@@ -1191,6 +1465,7 @@ measure_scan = function(path, calibration, opt = OPT, mask_dir = NULL) {
     n_objects     = seg$n_objects,
     leaf_px       = seg$leaf_px,
     holes_px      = seg$holes_px,
+    recovered_px  = seg$recovered_px,
     frac_of_image = round(seg$leaf_px / length(img$gray), 5),
     area_cm2      = round(area_cm2, 4),
     area_m2       = round(area_cm2 / 1e4, 8),

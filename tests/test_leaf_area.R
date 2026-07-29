@@ -321,5 +321,130 @@ expect("options are honored, not ignored",
 
 
 ## =============================================================================
+cat("\nEnd-to-end: a leaf whose interior is too pale to threshold\n")
+## =============================================================================
+
+## Rhododendron groenlandicum, abaxial side up. The revolute margins roll under
+## and read dark; the lamina between them is white tomentum measuring the same
+## brightness as the paper. And the dark margin is INTERRUPTED at the leaf base,
+## so the pale interior drains to the background and is not an enclosed hole --
+## which is why hole filling alone does not rescue it.
+#' An elliptical leaf with a dark rim, a pale textured interior, and a gap
+#' @param centre Gray level of the lamina. 246 is the paper level.
+#' @param gap_rows Rows over which the dark margin is missing.
+#' @param hair Speckle amplitude of the tomentum; 0 gives a smooth pale leaf.
+#' @param notch If TRUE, cut a wedge of bare paper into the leaf instead.
+hairy_leaf = function(centre = 247, gap_rows = 1000:1080, hair = 8,
+                      notch = FALSE) {
+  yy = matrix(seq_len(H), H, W);  xx = matrix(seq_len(W), H, W, byrow = TRUE)
+  leaf = ((yy - 700) / 380)^2 + ((xx - 500) / 150)^2 <= 1
+  if (notch) leaf = leaf & !(abs(xx - 500) < 70 & yy > 700)   # open bay of paper
+  rim = leaf & !erode(leaf, 9L)
+  rim[gap_rows, ] = FALSE                                     # margin interrupted
+
+  ## Tomentum: slightly BRIGHTER than the paper it lies on, and strongly
+  ## textured. Deliberately unblurred, so its local SD stays high the way real
+  ## hairs do, while the paper underneath is smooth.
+  tone = matrix(centre, H, W) + matrix(rnorm(H * W, 0, hair), H, W)
+  tone[rim] = 150
+
+  bg   = blank_scan(H, W)
+  soft = blur(leaf * 1, 2L)
+  list(img  = pmin(pmax(round(bg$paper * (1 - soft) + tone * soft), 0), 255),
+       true = sum(leaf))
+}
+
+dir.create(hair_dir <- file.path(tempdir(), "hairy", "scans"),
+           recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(hair_dir, "raw"), showWarnings = FALSE)
+invisible(tiff::writeTIFF(stamp(blank_scan(H, W), std_shape, 200) / 255,
+                          file.path(hair_dir, "standard.tif")))
+
+hair_truth = list()
+for (nm in c("tomentose", "smooth_pale", "open_notch")) {
+  f = switch(nm,
+    tomentose   = hairy_leaf(),                       # pale AND hairy -> recover
+    smooth_pale = hairy_leaf(hair = 0),               # pale but smooth -> refuse
+    open_notch  = hairy_leaf(centre = 150, hair = 4, notch = TRUE))  # dark leaf, real bay
+  hair_truth[[nm]] = f$true
+  invisible(tiff::writeTIFF(f$img / 255, file.path(hair_dir, "raw", paste0(nm, ".tif"))))
+}
+
+hres = run_leaf_area(
+  scan_dir   = file.path(hair_dir, "raw"),
+  standards  = data.frame(path = file.path(hair_dir, "standard.tif"),
+                          area_cm2 = STD_TRUE_CM2, dpi = 400,
+                          stringsAsFactors = FALSE),
+  output_csv = file.path(tempdir(), "hairy", "out.csv"),
+  mask_dir = NULL, quiet = TRUE)
+hrow = function(id) hres[match(id, hres$scan_id), ]
+
+cat("\n")
+expect_close("tomentose lamina at the paper level is recovered",
+             hrow("tomentose")$leaf_px, hair_truth$tomentose, 6.0)
+expect("...and is flagged, so the addition is never silent",
+       grepl("interior_recovered", hrow("tomentose")$flags), hrow("tomentose")$flags)
+expect("...and recovered_px accounts for most of the leaf",
+       hrow("tomentose")$recovered_px > 0.4 * hair_truth$tomentose,
+       sprintf("%d of %d px", hrow("tomentose")$recovered_px, hair_truth$tomentose))
+
+## The same pale leaf but with an UNBROKEN margin. Hole filling then hands the
+## pale interior to the tone estimate, and without a bound on the cutoff the
+## segmentation runs away and calls most of the plate leaf.
+invisible(tiff::writeTIFF(hairy_leaf(gap_rows = integer(0))$img / 255,
+                          file.path(hair_dir, "raw", "closed_rim.tif")))
+cres = run_leaf_area(file.path(hair_dir, "raw"),
+                     data.frame(path = file.path(hair_dir, "standard.tif"),
+                                area_cm2 = STD_TRUE_CM2, dpi = 400,
+                                stringsAsFactors = FALSE),
+                     file.path(tempdir(), "hairy", "out3.csv"),
+                     mask_dir = NULL, quiet = TRUE)
+crow = cres[match("closed_rim", cres$scan_id), ]
+expect("a pale interior with a closed margin does not run away",
+       !is.na(crow$leaf_px) && crow$leaf_px < 1.5 * hair_truth$tomentose,
+       sprintf("%d px against a leaf of %d", crow$leaf_px, hair_truth$tomentose))
+expect("...and its cutoff stays below the paper level",
+       crow$cutoff <= crow$paper - 15, sprintf("cutoff %.0f, paper %.0f", crow$cutoff, crow$paper))
+
+expect("a genuine bay of paper cut into a leaf is REFUSED, not filled in",
+       hrow("open_notch")$recovered_px == 0 &&
+       !grepl("interior_recovered", hrow("open_notch")$flags),
+       sprintf("recovered %d px", hrow("open_notch")$recovered_px))
+expect_close("...so a notched leaf still measures its own area",
+             hrow("open_notch")$leaf_px, hair_truth$open_notch, 2.0)
+
+expect("a SMOOTH pale interior is refused, and the limitation is documented",
+       hrow("smooth_pale")$recovered_px == 0,
+       sprintf("recovered %d px", hrow("smooth_pale")$recovered_px))
+
+## The regression that motivated the design: an earlier version used a
+## morphological closing instead of the hull, which bridged the notches of a
+## serrate leaf and squared off its teeth.
+serrate = local({
+  yy = matrix(seq_len(H), H, W); xx = matrix(seq_len(W), H, W, byrow = TRUE)
+  base = ((yy - 700) / 380)^2 + ((xx - 500) / 200)^2 <= 1
+  base & !((yy %% 60) < 22 & abs(((yy - 700) / 380)^2 + ((xx - 500) / 200)^2 - 1) < 0.35)
+})
+invisible(tiff::writeTIFF(stamp(blank_scan(H, W), serrate, 150) / 255,
+                          file.path(hair_dir, "raw2_serrate.tif")))
+dir.create(file.path(hair_dir, "raw2"), showWarnings = FALSE)
+invisible(file.rename(file.path(hair_dir, "raw2_serrate.tif"),
+            file.path(hair_dir, "raw2", "serrate.tif")))
+sres = run_leaf_area(file.path(hair_dir, "raw2"),
+                     data.frame(path = file.path(hair_dir, "standard.tif"),
+                                area_cm2 = STD_TRUE_CM2, dpi = 400,
+                                stringsAsFactors = FALSE),
+                     file.path(tempdir(), "hairy", "out2.csv"),
+                     mask_dir = NULL, quiet = TRUE)
+expect("the teeth of a serrate leaf are not squared off",
+       sres$recovered_px[1] == 0, sprintf("recovered %d px", sres$recovered_px[1]))
+## A spiky outline has a large perimeter for its area, so the tolerance is
+## looser here than elsewhere. It is still tight enough to catch the failure it
+## guards against: squaring off the teeth added over 10%.
+expect_close("...and its area is its own, not its convex hull's",
+             sres$leaf_px[1], sum(serrate), 6.0)
+
+
+## =============================================================================
 cat(sprintf("\n%d passed, %d failed\n", PASS, FAIL))
 if (FAIL > 0L) quit(status = 1L)
